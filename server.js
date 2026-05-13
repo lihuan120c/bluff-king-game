@@ -2,7 +2,9 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
+const mongoose = require('mongoose');
 const { WORD_LIBRARY } = require('./words');
+const { User, PlayedWords } = require('./models');
 
 const app = express();
 const server = http.createServer(app);
@@ -10,9 +12,20 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-const users = new Map();
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/bluffking';
+let dbConnected = false;
+mongoose.connect(MONGODB_URI).then(() => {
+  dbConnected = true;
+  console.log('MongoDB 连接成功');
+}).catch(err => {
+  console.error('MongoDB 连接失败:', err.message);
+  console.log('将使用内存模式运行（数据不会持久化）');
+});
+mongoose.connection.on('connected', () => { dbConnected = true; });
+mongoose.connection.on('disconnected', () => { dbConnected = false; });
+
 const rooms = new Map();
-const playedWords = new Map();
+const socketPlayedWords = new Map();
 
 function broadcastRoomList() {
   const roomList = [];
@@ -135,7 +148,7 @@ function getAvailableWords(roomId) {
   const playerIds = room.players.map(p => p.id);
   const usedWords = new Set();
   for (const pid of playerIds) {
-    const played = playedWords.get(pid) || new Set();
+    const played = socketPlayedWords.get(pid) || new Set();
     for (const w of played) usedWords.add(w);
   }
   return WORD_LIBRARY.filter(w => !usedWords.has(w.name));
@@ -214,26 +227,50 @@ function startTimer(roomId, seconds, onTick, onEnd) {
   }, 1000);
 }
 
+const memoryUsers = new Map();
+
 io.on('connection', (socket) => {
 
-  socket.on('register', ({ account, nickname }, cb) => {
-    if (!account || !nickname) return cb({ ok: false, msg: '请填写账号和昵称' });
-    if (!/^[a-zA-Z0-9]+$/.test(account)) return cb({ ok: false, msg: '账号只能包含字母和数字' });
-    for (const [, u] of users) {
-      if (u.account === account) return cb({ ok: false, msg: '账号已被注册' });
+  socket.on('register', async ({ account, nickname }, cb) => {
+    try {
+      if (!account || !nickname) return cb({ ok: false, msg: '请填写账号和昵称' });
+      if (!/^[a-zA-Z0-9]+$/.test(account)) return cb({ ok: false, msg: '账号只能包含字母和数字' });
+      if (dbConnected) {
+        const existing = await User.findOne({ account });
+        if (existing) return cb({ ok: false, msg: '账号已被注册' });
+        await User.create({ account, nickname });
+      } else {
+        if (memoryUsers.has(account)) return cb({ ok: false, msg: '账号已被注册' });
+        memoryUsers.set(account, { account, nickname });
+      }
+      cb({ ok: true });
+    } catch (e) {
+      cb({ ok: false, msg: '注册失败，请重试' });
     }
-    users.set(account, { account, nickname });
-    cb({ ok: true });
   });
 
-  socket.on('login', ({ account }, cb) => {
-    const user = users.get(account);
-    if (!user) return cb({ ok: false, msg: '账号不存在，请先注册' });
-    socket.data.account = account;
-    socket.data.nickname = user.nickname;
-    if (!playedWords.has(socket.id)) playedWords.set(socket.id, new Set());
-    cb({ ok: true, nickname: user.nickname });
-    broadcastRoomList();
+  socket.on('login', async ({ account }, cb) => {
+    try {
+      let user;
+      if (dbConnected) {
+        user = await User.findOne({ account });
+      } else {
+        user = memoryUsers.get(account);
+      }
+      if (!user) return cb({ ok: false, msg: '账号不存在，请先注册' });
+      socket.data.account = account;
+      socket.data.nickname = user.nickname;
+      if (dbConnected) {
+        const record = await PlayedWords.findOne({ account });
+        socketPlayedWords.set(socket.id, new Set(record ? record.words : []));
+      } else {
+        if (!socketPlayedWords.has(socket.id)) socketPlayedWords.set(socket.id, new Set());
+      }
+      cb({ ok: true, nickname: user.nickname });
+      broadcastRoomList();
+    } catch (e) {
+      cb({ ok: false, msg: '登录失败，请重试' });
+    }
   });
 
   socket.on('getRooms', () => {
@@ -392,9 +429,17 @@ io.on('connection', (socket) => {
     room.gameState.honestPlayerNickname = honest.nickname;
 
     for (const p of room.players) {
-      const played = playedWords.get(p.id) || new Set();
+      const played = socketPlayedWords.get(p.id) || new Set();
       played.add(word.name);
-      playedWords.set(p.id, played);
+      socketPlayedWords.set(p.id, played);
+      const sock = io.sockets.sockets.get(p.id);
+      if (sock && sock.data.account) {
+        PlayedWords.findOneAndUpdate(
+          { account: sock.data.account },
+          { $addToSet: { words: word.name } },
+          { upsert: true }
+        ).catch(() => {});
+      }
     }
 
     room.gameState.phase = 'countdown_reveal';
