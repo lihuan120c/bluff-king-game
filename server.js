@@ -12,6 +12,17 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+app.get('/api/status', async (req, res) => {
+  let userCount = 0;
+  try { userCount = await User.countDocuments(); } catch(e) {}
+  res.json({
+    dbConnected,
+    mongoState: mongoose.connection.readyState,
+    userCount,
+    hasMongoURI: !!process.env.MONGODB_URI
+  });
+});
+
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/bluffking';
 let dbConnected = false;
 mongoose.connect(MONGODB_URI).then(() => {
