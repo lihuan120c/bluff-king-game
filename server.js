@@ -301,7 +301,7 @@ io.on('connection', (socket) => {
       password: password || null,
       creatorId: socket.id,
       creatorNickname: socket.data.nickname,
-      players: [{ id: socket.id, nickname: socket.data.nickname, score: 0 }],
+      players: [{ id: socket.id, nickname: socket.data.nickname, account: socket.data.account, score: 0 }],
       started: false,
       gameState: null,
       _timer: null
@@ -321,7 +321,7 @@ io.on('connection', (socket) => {
     if (room.password && room.password !== password) return cb({ ok: false, msg: '密码错误' });
     if (room.players.find(p => p.id === socket.id)) return cb({ ok: false, msg: '你已在房间中' });
 
-    room.players.push({ id: socket.id, nickname: socket.data.nickname, score: 0 });
+    room.players.push({ id: socket.id, nickname: socket.data.nickname, account: socket.data.account, score: 0 });
     socket.join(roomId);
     socket.data.roomId = roomId;
     cb({ ok: true });
@@ -592,18 +592,84 @@ io.on('connection', (socket) => {
     cb({ ok: true });
   });
 
+  socket.on('rejoinRoom', ({ roomId }, cb) => {
+    if (!socket.data.account) return cb({ ok: false, msg: '请先登录' });
+    const room = rooms.get(roomId);
+    if (!room) return cb({ ok: false, msg: '房间不存在' });
+
+    const existing = room.players.find(p => p.account === socket.data.account);
+    if (existing) {
+      if (existing._disconnectTimer) {
+        clearTimeout(existing._disconnectTimer);
+        existing._disconnectTimer = null;
+      }
+      existing.id = socket.id;
+      socket.join(roomId);
+      socket.data.roomId = roomId;
+      if (room.creatorId === existing._oldId) {
+        room.creatorId = socket.id;
+      }
+      if (room.gameState) {
+        const gs = room.gameState;
+        if (gs.guesserId === existing._oldId) gs.guesserId = socket.id;
+        if (gs.honestPlayerId === existing._oldId) gs.honestPlayerId = socket.id;
+        if (gs.answerOrder) {
+          gs.answerOrder.forEach(p => { if (p.id === existing._oldId) p.id = socket.id; });
+        }
+        if (gs.judgmentResult) {
+          const jr = gs.judgmentResult;
+          if (jr.chosenHonestId === existing._oldId) jr.chosenHonestId = socket.id;
+          if (jr.chosenBluffKingId === existing._oldId) jr.chosenBluffKingId = socket.id;
+        }
+        if (gs.revealResult && gs.revealResult.realHonestId === existing._oldId) {
+          gs.revealResult.realHonestId = socket.id;
+        }
+      }
+      delete existing._oldId;
+      cb({ ok: true });
+      broadcastRoomList();
+      broadcastRoomState(roomId);
+    } else {
+      if (room.started) return cb({ ok: false, msg: '游戏已开始，无法加入' });
+      room.players.push({ id: socket.id, nickname: socket.data.nickname, account: socket.data.account, score: 0 });
+      socket.join(roomId);
+      socket.data.roomId = roomId;
+      cb({ ok: true });
+      broadcastRoomList();
+      broadcastRoomState(roomId);
+    }
+  });
+
   socket.on('disconnect', () => {
     const roomId = socket.data.roomId;
     if (roomId) {
       const room = rooms.get(roomId);
       if (room) {
-        room.players = room.players.filter(p => p.id !== socket.id);
-        if (room.players.length === 0) {
-          clearRoomTimer(roomId);
-          rooms.delete(roomId);
-        } else if (room.creatorId === socket.id) {
-          room.creatorId = room.players[0].id;
-          room.creatorNickname = room.players[0].nickname;
+        const player = room.players.find(p => p.id === socket.id);
+        if (player && socket.data.account) {
+          player._oldId = socket.id;
+          player.account = socket.data.account;
+          player._disconnectTimer = setTimeout(() => {
+            room.players = room.players.filter(p => p !== player);
+            if (room.players.length === 0) {
+              clearRoomTimer(roomId);
+              rooms.delete(roomId);
+            } else if (room.creatorId === player._oldId || room.creatorId === socket.id) {
+              room.creatorId = room.players[0].id;
+              room.creatorNickname = room.players[0].nickname;
+            }
+            broadcastRoomList();
+            if (rooms.has(roomId)) broadcastRoomState(roomId);
+          }, 60000);
+        } else {
+          room.players = room.players.filter(p => p.id !== socket.id);
+          if (room.players.length === 0) {
+            clearRoomTimer(roomId);
+            rooms.delete(roomId);
+          } else if (room.creatorId === socket.id) {
+            room.creatorId = room.players[0].id;
+            room.creatorNickname = room.players[0].nickname;
+          }
         }
         broadcastRoomList();
         if (rooms.has(roomId)) broadcastRoomState(roomId);

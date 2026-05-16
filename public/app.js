@@ -1,10 +1,41 @@
-const socket = io();
+const socket = io({ reconnection: true, reconnectionDelay: 1000, reconnectionAttempts: Infinity });
 
 let myNickname = '';
 let myAccount = '';
 let currentRoomId = null;
 let currentRoomState = null;
 let pendingJoinRoomId = null;
+
+// --- 断线重连 ---
+socket.on('connect', () => {
+  if (myAccount) {
+    socket.emit('login', { account: myAccount }, (res) => {
+      if (res.ok) {
+        myNickname = res.nickname;
+        if (currentRoomId) {
+          socket.emit('rejoinRoom', { roomId: currentRoomId }, (rr) => {
+            if (rr.ok) {
+              showPage('page-room');
+            } else {
+              currentRoomId = null;
+              currentRoomState = null;
+              showPage('page-lobby');
+              socket.emit('getRooms');
+            }
+          });
+        } else {
+          showPage('page-lobby');
+          socket.emit('getRooms');
+        }
+        announce('已重新连接');
+      }
+    });
+  }
+});
+
+socket.on('disconnect', () => {
+  if (myAccount) announce('连接断开，正在重连...');
+});
 
 // --- Page Navigation ---
 function showPage(id) {
