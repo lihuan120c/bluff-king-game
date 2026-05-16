@@ -12,28 +12,12 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.get('/api/status', async (req, res) => {
-  let userCount = 0;
-  try { userCount = await User.countDocuments(); } catch(e) {}
-  res.json({
-    dbConnected,
-    mongoState: mongoose.connection.readyState,
-    userCount,
-    hasMongoURI: !!process.env.MONGODB_URI,
-    dbError,
-    uriPrefix: (process.env.MONGODB_URI || '').substring(0, 30) + '...'
-  });
-});
-
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/bluffking';
 let dbConnected = false;
-let dbError = null;
 mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).then(() => {
   dbConnected = true;
-  dbError = null;
   console.log('MongoDB 连接成功');
 }).catch(err => {
-  dbError = err.message;
   console.error('MongoDB 连接失败:', err.message);
   console.log('将使用内存模式运行（数据不会持久化）');
 });
@@ -472,7 +456,7 @@ io.on('connection', (socket) => {
       room.gameState.phase = 'viewing';
       broadcastRoomState(roomId);
 
-      startTimer(roomId, 30, null, () => {
+      startTimer(roomId, 60, null, () => {
         if (!rooms.has(roomId) || !room.gameState) return;
         room.gameState.phase = 'preparing';
         broadcastRoomState(roomId);
@@ -482,7 +466,7 @@ io.on('connection', (socket) => {
           if (s) s.emit('announcement', '准备环节开始！所有人只能看到词条名称');
         }
 
-        startTimer(roomId, 10, null, () => {
+        startTimer(roomId, 20, null, () => {
           if (!rooms.has(roomId) || !room.gameState) return;
           room.gameState.phase = 'answering';
 
