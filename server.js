@@ -19,20 +19,25 @@ app.get('/api/status', async (req, res) => {
     dbConnected,
     mongoState: mongoose.connection.readyState,
     userCount,
-    hasMongoURI: !!process.env.MONGODB_URI
+    hasMongoURI: !!process.env.MONGODB_URI,
+    dbError,
+    uriPrefix: (process.env.MONGODB_URI || '').substring(0, 30) + '...'
   });
 });
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/bluffking';
 let dbConnected = false;
-mongoose.connect(MONGODB_URI).then(() => {
+let dbError = null;
+mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).then(() => {
   dbConnected = true;
+  dbError = null;
   console.log('MongoDB 连接成功');
 }).catch(err => {
+  dbError = err.message;
   console.error('MongoDB 连接失败:', err.message);
   console.log('将使用内存模式运行（数据不会持久化）');
 });
-mongoose.connection.on('connected', () => { dbConnected = true; });
+mongoose.connection.on('connected', () => { dbConnected = true; dbError = null; });
 mongoose.connection.on('disconnected', () => { dbConnected = false; });
 
 const rooms = new Map();
