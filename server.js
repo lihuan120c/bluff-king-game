@@ -8,7 +8,11 @@ const { User, PlayedWords } = require('./models');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, {
+  cors: { origin: '*' },
+  pingTimeout: 60000,
+  pingInterval: 25000
+});
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -21,11 +25,37 @@ mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).then(() => {
   console.error('MongoDB 连接失败:', err.message);
   console.log('将使用内存模式运行（数据不会持久化）');
 });
-mongoose.connection.on('connected', () => { dbConnected = true; dbError = null; });
+mongoose.connection.on('connected', () => { dbConnected = true; });
 mongoose.connection.on('disconnected', () => { dbConnected = false; });
 
+// 房间与会话状态（内存）。玩家身份一律以 account 为准，socket.id 仅用于消息路由
 const rooms = new Map();
-const socketPlayedWords = new Map();
+const accountSockets = new Map();      // account -> socket.id
+const playedWordsByAccount = new Map(); // account -> Set<wordName>
+const memoryUsers = new Map();          // 数据库不可用时的降级存储
+
+function getSocketByAccount(account) {
+  const sid = accountSockets.get(account);
+  return sid ? io.sockets.sockets.get(sid) : null;
+}
+
+function emitToPlayer(account, event, data) {
+  const s = getSocketByAccount(account);
+  if (s) s.emit(event, data);
+}
+
+function announceRoom(roomId, msg) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  for (const p of room.players) emitToPlayer(p.account, 'announcement', msg);
+}
+
+function findRoomByAccount(account) {
+  for (const [rid, room] of rooms) {
+    if (room.players.find(p => p.account === account)) return rid;
+  }
+  return null;
+}
 
 function broadcastRoomList() {
   const roomList = [];
@@ -46,97 +76,62 @@ function broadcastRoomState(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
   const playerList = room.players.map(p => ({
-    id: p.id,
+    account: p.account,
     nickname: p.nickname,
     score: p.score,
-    isCreator: p.id === room.creatorId
+    online: p.online,
+    isCreator: p.account === room.creatorAccount
   }));
-  const state = {
-    id: roomId,
-    name: room.name,
-    started: room.started,
-    creatorId: room.creatorId,
-    players: playerList,
-    gameState: room.gameState
-  };
   for (const p of room.players) {
-    const sock = io.sockets.sockets.get(p.id);
+    const sock = getSocketByAccount(p.account);
     if (sock) {
-      const personalState = { ...state };
-      if (room.gameState) {
-        personalState.gameState = buildPersonalGameState(room, p.id);
-      }
-      sock.emit('roomState', personalState);
+      sock.emit('roomState', {
+        id: roomId,
+        name: room.name,
+        started: room.started,
+        paused: room.paused,
+        creatorAccount: room.creatorAccount,
+        players: playerList,
+        gameState: room.gameState ? buildPersonalGameState(room, p.account) : null
+      });
     }
   }
 }
 
-function buildPersonalGameState(room, playerId) {
+function buildPersonalGameState(room, account) {
   const gs = room.gameState;
   if (!gs) return null;
   const base = {
     phase: gs.phase,
-    guesserId: gs.guesserId,
+    guesserAccount: gs.guesserAccount,
     guesserNickname: gs.guesserNickname,
     roundNumber: gs.roundNumber,
     totalRounds: gs.totalRounds,
     timer: gs.timer,
-    wordName: gs.wordName,
     answerOrder: gs.answerOrder,
     judgmentResult: gs.judgmentResult,
     revealResult: gs.revealResult
   };
 
+  const role = account === gs.honestAccount ? 'honest'
+    : account === gs.guesserAccount ? 'guesser' : 'bluffer';
+
   if (gs.phase === 'choosing') {
-    if (playerId === gs.guesserId) {
-      base.wordOptions = gs.wordOptions;
-    }
-  } else if (gs.phase === 'countdown_reveal') {
+    if (account === gs.guesserAccount) base.wordOptions = gs.wordOptions;
+  } else if (['countdown_reveal', 'viewing', 'preparing', 'answering', 'judging', 'reveal'].includes(gs.phase)) {
     base.wordName = gs.wordName;
-  } else if (gs.phase === 'viewing') {
-    base.wordName = gs.wordName;
-    if (playerId === gs.honestPlayerId) {
+    base.categories = gs.categories;
+    if (gs.phase !== 'countdown_reveal') base.role = role;
+    if (gs.phase === 'viewing' && role === 'honest') {
       base.wordDescription = gs.wordDescription;
-      base.role = 'honest';
-    } else if (playerId === gs.guesserId) {
-      base.role = 'guesser';
-    } else {
-      base.role = 'bluffer';
     }
-  } else if (gs.phase === 'preparing') {
-    base.wordName = gs.wordName;
-    if (playerId === gs.honestPlayerId) {
-      base.role = 'honest';
-    } else if (playerId === gs.guesserId) {
-      base.role = 'guesser';
-    } else {
-      base.role = 'bluffer';
-    }
-  } else if (gs.phase === 'answering') {
-    base.wordName = gs.wordName;
-    if (playerId === gs.honestPlayerId) {
-      base.role = 'honest';
-    } else if (playerId === gs.guesserId) {
-      base.role = 'guesser';
-    } else {
-      base.role = 'bluffer';
-    }
-  } else if (gs.phase === 'judging') {
-    base.wordName = gs.wordName;
-    if (playerId === gs.guesserId) {
+    if (gs.phase === 'judging' && role === 'guesser') {
       base.isJudging = true;
     }
-    if (playerId === gs.honestPlayerId) {
-      base.role = 'honest';
-    } else if (playerId === gs.guesserId) {
-      base.role = 'guesser';
-    } else {
-      base.role = 'bluffer';
+    if (gs.phase === 'reveal' && gs.revealResult) {
+      base.wordDescription = gs.wordDescription;
+      base.correctCategory = gs.correctCategory;
     }
-  } else if (gs.phase === 'reveal') {
-    base.wordName = gs.wordName;
-    base.honestPlayerId = gs.honestPlayerId;
-    base.honestPlayerNickname = gs.honestPlayerNickname;
   }
 
   return base;
@@ -145,10 +140,9 @@ function buildPersonalGameState(room, playerId) {
 function getAvailableWords(roomId) {
   const room = rooms.get(roomId);
   if (!room) return [];
-  const playerIds = room.players.map(p => p.id);
   const usedWords = new Set();
-  for (const pid of playerIds) {
-    const played = socketPlayedWords.get(pid) || new Set();
+  for (const p of room.players) {
+    const played = playedWordsByAccount.get(p.account) || new Set();
     for (const w of played) usedWords.add(w);
   }
   return WORD_LIBRARY.filter(w => !usedWords.has(w.name));
@@ -156,26 +150,105 @@ function getAvailableWords(roomId) {
 
 function pickRandomWords(roomId, count = 5) {
   const available = getAvailableWords(roomId);
-  const shuffled = available.sort(() => Math.random() - 0.5);
+  const shuffled = [...available].sort(() => Math.random() - 0.5);
   return shuffled.slice(0, count);
+}
+
+// --- 统一的阶段计时器：暂停时冻结剩余秒数，恢复时继续 ---
+
+function clearRoomTimer(roomId) {
+  const room = rooms.get(roomId);
+  if (room && room._timer) {
+    clearInterval(room._timer);
+    room._timer = null;
+  }
+}
+
+function runRoomInterval(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  clearRoomTimer(roomId);
+  room._timer = setInterval(() => {
+    const r = rooms.get(roomId);
+    if (!r || !r.gameState) { clearRoomTimer(roomId); return; }
+    if (r.paused) return;
+    r.gameState.timer--;
+    broadcastRoomState(roomId);
+    if (r.gameState.timer <= 0) {
+      clearInterval(r._timer);
+      r._timer = null;
+      const next = r._timerNext;
+      r._timerNext = null;
+      phaseAdvance(roomId, next);
+    }
+  }, 1000);
+}
+
+function startPhaseTimer(roomId, seconds, nextKey) {
+  const room = rooms.get(roomId);
+  if (!room || !room.gameState) return;
+  room.gameState.timer = seconds;
+  room._timerNext = nextKey;
+  broadcastRoomState(roomId);
+  runRoomInterval(roomId);
+}
+
+function phaseAdvance(roomId, next) {
+  const room = rooms.get(roomId);
+  if (!room || !room.gameState) return;
+  const gs = room.gameState;
+
+  if (next === 'toViewing') {
+    gs.phase = 'viewing';
+    startPhaseTimer(roomId, 20, 'toPreparing');
+  } else if (next === 'toPreparing') {
+    gs.phase = 'preparing';
+    announceRoom(roomId, '准备环节开始！所有人只能看到词条名称');
+    startPhaseTimer(roomId, 20, 'toAnswering');
+  } else if (next === 'toAnswering') {
+    gs.phase = 'answering';
+    gs.timer = null;
+    const others = room.players.filter(p => p.account !== gs.guesserAccount);
+    const shuffled = [...others].sort(() => Math.random() - 0.5);
+    gs.answerOrder = shuffled.map(p => ({ account: p.account, nickname: p.nickname }));
+    broadcastRoomState(roomId);
+    announceRoom(roomId, '开始答题！请按顺序作答');
+  } else if (next === 'toRevealResult') {
+    doRevealResult(roomId);
+  } else if (next === 'toNextRound') {
+    if (gs.roundNumber >= gs.totalRounds) {
+      finishGame(roomId);
+    } else {
+      startNextRound(roomId);
+    }
+  }
 }
 
 function startNextRound(roomId) {
   const room = rooms.get(roomId);
-  if (!room || !room.started) return;
+  if (!room || !room.started || !room.gameState) return;
 
   const gs = room.gameState;
   gs.roundNumber++;
-  const guesserIndex = (gs.roundNumber - 1) % room.players.length;
-  const guesser = room.players[guesserIndex];
-  gs.guesserId = guesser.id;
+
+  // 按开局时洗好的顺序轮换猜词人，跳过离线玩家
+  let idx = (gs.roundNumber - 1) % room.players.length;
+  let attempts = 0;
+  while (!room.players[idx].online && attempts < room.players.length) {
+    idx = (idx + 1) % room.players.length;
+    attempts++;
+  }
+  const guesser = room.players[idx];
+  gs.guesserAccount = guesser.account;
   gs.guesserNickname = guesser.nickname;
   gs.phase = 'choosing';
   gs.wordOptions = pickRandomWords(roomId, 5);
   gs.wordName = null;
   gs.wordDescription = null;
-  gs.honestPlayerId = null;
-  gs.honestPlayerNickname = null;
+  gs.categories = null;
+  gs.correctCategory = null;
+  gs.honestAccount = null;
+  gs.honestNickname = null;
   gs.timer = null;
   gs.answerOrder = null;
   gs.judgmentResult = null;
@@ -188,46 +261,105 @@ function startNextRound(roomId) {
   }
 
   broadcastRoomState(roomId);
-
-  for (const p of room.players) {
-    const sock = io.sockets.sockets.get(p.id);
-    if (sock) {
-      sock.emit('announcement', `第 ${gs.roundNumber} 轮开始！猜词人是：${guesser.nickname}`);
-    }
-  }
+  announceRoom(roomId, `第 ${gs.roundNumber} 轮开始！猜词人是：${guesser.nickname}`);
 }
 
-function clearRoomTimer(roomId) {
-  const room = rooms.get(roomId);
-  if (room && room._timer) {
-    clearInterval(room._timer);
-    room._timer = null;
-  }
+function addScore(room, account, pts) {
+  const p = room.players.find(x => x.account === account);
+  if (p) p.score += pts;
 }
 
-function startTimer(roomId, seconds, onTick, onEnd) {
+function doRevealResult(roomId) {
   const room = rooms.get(roomId);
-  if (!room) return;
-  clearRoomTimer(roomId);
-  room.gameState.timer = seconds;
+  if (!room || !room.gameState) return;
+  const gs = room.gameState;
+  const jr = gs.judgmentResult;
+  if (!jr) return;
+
+  const correct = jr.honestAccount === gs.honestAccount;
+  const scoreLines = [];
+
+  if (correct) {
+    addScore(room, gs.guesserAccount, 2);
+    addScore(room, gs.honestAccount, 1);
+    scoreLines.push(`✅ 猜对老实人：${gs.guesserNickname} +2，${gs.honestNickname} +1`);
+  } else {
+    addScore(room, jr.honestAccount, 3);
+    scoreLines.push(`❌ 猜错了：${jr.honestNickname} 瞎掰成功 +3`);
+  }
+
+  if (jr.kingAccount === gs.honestAccount) {
+    addScore(room, gs.honestAccount, 2);
+    scoreLines.push(`😅 把老实人当成了瞎掰王：${gs.honestNickname} +2`);
+  } else {
+    addScore(room, gs.guesserAccount, 1);
+    addScore(room, jr.kingAccount, -1);
+    scoreLines.push(`🎯 瞎掰王指认正确：${gs.guesserNickname} +1，${jr.kingNickname} 被识破 -1`);
+  }
+
+  gs.revealResult = {
+    correct,
+    realHonestAccount: gs.honestAccount,
+    realHonestNickname: gs.honestNickname,
+    scoreLines
+  };
+
   broadcastRoomState(roomId);
+  announceRoom(roomId, correct
+    ? `猜对了！真正的老实人就是 ${gs.honestNickname}！`
+    : `猜错了！真正的老实人是 ${gs.honestNickname}！`);
 
-  room._timer = setInterval(() => {
-    if (!rooms.has(roomId)) { clearRoomTimer(roomId); return; }
-    const r = rooms.get(roomId);
-    if (!r.gameState) { clearRoomTimer(roomId); return; }
-    r.gameState.timer--;
-    if (onTick) onTick(r.gameState.timer);
-    broadcastRoomState(roomId);
-    if (r.gameState.timer <= 0) {
-      clearInterval(r._timer);
-      r._timer = null;
-      if (onEnd) onEnd();
-    }
-  }, 1000);
+  startPhaseTimer(roomId, 8, 'toNextRound');
 }
 
-const memoryUsers = new Map();
+async function recordStats(room) {
+  if (room.statsRecorded || room.players.length === 0) return;
+  room.statsRecorded = true;
+  const maxScore = Math.max(...room.players.map(p => p.score));
+  if (!dbConnected) return;
+  for (const p of room.players) {
+    User.updateOne(
+      { account: p.account },
+      { $inc: { gamesPlayed: 1, totalScore: p.score, wins: p.score === maxScore ? 1 : 0 } }
+    ).catch(() => {});
+  }
+}
+
+function finishGame(roomId) {
+  const room = rooms.get(roomId);
+  if (!room || !room.gameState) return;
+  clearRoomTimer(roomId);
+  room._timerNext = null;
+  room.paused = false;
+  room.gameState.phase = 'gameOver';
+  room.gameState.timer = null;
+  room.started = false;
+  recordStats(room);
+  broadcastRoomState(roomId);
+  broadcastRoomList();
+  announceRoom(roomId, '游戏结束！查看最终排名');
+}
+
+// 定期清理：全员离线超过 15 分钟的房间自动销毁
+setInterval(() => {
+  const now = Date.now();
+  let changed = false;
+  for (const [rid, room] of rooms) {
+    const allOffline = room.players.every(p => !p.online);
+    if (allOffline) {
+      if (!room.emptySince) {
+        room.emptySince = now;
+      } else if (now - room.emptySince > 15 * 60 * 1000) {
+        clearRoomTimer(rid);
+        rooms.delete(rid);
+        changed = true;
+      }
+    } else {
+      room.emptySince = null;
+    }
+  }
+  if (changed) broadcastRoomList();
+}, 60000);
 
 io.on('connection', (socket) => {
 
@@ -258,18 +390,66 @@ io.on('connection', (socket) => {
         user = memoryUsers.get(account);
       }
       if (!user) return cb({ ok: false, msg: '账号不存在，请先注册' });
+
+      // 同一账号在别处登录时，踢掉旧连接
+      const oldSocket = getSocketByAccount(account);
+      if (oldSocket && oldSocket.id !== socket.id) {
+        oldSocket.data.account = null;
+        oldSocket.data.roomId = null;
+        oldSocket.emit('forceLogout');
+      }
+
       socket.data.account = account;
       socket.data.nickname = user.nickname;
-      if (dbConnected) {
-        const record = await PlayedWords.findOne({ account });
-        socketPlayedWords.set(socket.id, new Set(record ? record.words : []));
-      } else {
-        if (!socketPlayedWords.has(socket.id)) socketPlayedWords.set(socket.id, new Set());
+      accountSockets.set(account, socket.id);
+
+      if (!playedWordsByAccount.has(account)) {
+        if (dbConnected) {
+          const record = await PlayedWords.findOne({ account });
+          playedWordsByAccount.set(account, new Set(record ? record.words : []));
+        } else {
+          playedWordsByAccount.set(account, new Set());
+        }
       }
-      cb({ ok: true, nickname: user.nickname });
-      broadcastRoomList();
+
+      // 如果该账号还在某个房间里，自动恢复（断线重连/刷新页面）
+      const myRoomId = findRoomByAccount(account);
+      if (myRoomId) {
+        const room = rooms.get(myRoomId);
+        const player = room.players.find(p => p.account === account);
+        player.online = true;
+        socket.data.roomId = myRoomId;
+        cb({ ok: true, nickname: user.nickname, roomId: myRoomId });
+        broadcastRoomState(myRoomId);
+        broadcastRoomList();
+      } else {
+        cb({ ok: true, nickname: user.nickname });
+        broadcastRoomList();
+      }
     } catch (e) {
       cb({ ok: false, msg: '登录失败，请重试' });
+    }
+  });
+
+  socket.on('getProfile', async (cb) => {
+    const account = socket.data.account;
+    if (!account) return cb({ ok: false });
+    try {
+      if (dbConnected) {
+        const u = await User.findOne({ account });
+        if (!u) return cb({ ok: false });
+        return cb({
+          ok: true,
+          nickname: u.nickname,
+          account: u.account,
+          gamesPlayed: u.gamesPlayed || 0,
+          totalScore: u.totalScore || 0,
+          wins: u.wins || 0
+        });
+      }
+      cb({ ok: true, nickname: socket.data.nickname, account, gamesPlayed: 0, totalScore: 0, wins: 0 });
+    } catch (e) {
+      cb({ ok: false });
     }
   });
 
@@ -279,18 +459,22 @@ io.on('connection', (socket) => {
 
   socket.on('createRoom', ({ name, password }, cb) => {
     if (!socket.data.account) return cb({ ok: false, msg: '请先登录' });
+    if (socket.data.roomId) return cb({ ok: false, msg: '你已在其他房间中' });
     const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
     rooms.set(roomId, {
       name: name || '未命名房间',
       password: password || null,
-      creatorId: socket.id,
+      creatorAccount: socket.data.account,
       creatorNickname: socket.data.nickname,
-      players: [{ id: socket.id, nickname: socket.data.nickname, account: socket.data.account, score: 0 }],
+      players: [{ account: socket.data.account, nickname: socket.data.nickname, score: 0, online: true }],
       started: false,
+      paused: false,
       gameState: null,
-      _timer: null
+      statsRecorded: false,
+      emptySince: null,
+      _timer: null,
+      _timerNext: null
     });
-    socket.join(roomId);
     socket.data.roomId = roomId;
     cb({ ok: true, roomId });
     broadcastRoomList();
@@ -301,12 +485,22 @@ io.on('connection', (socket) => {
     if (!socket.data.account) return cb({ ok: false, msg: '请先登录' });
     const room = rooms.get(roomId);
     if (!room) return cb({ ok: false, msg: '房间不存在' });
+
+    const existing = room.players.find(p => p.account === socket.data.account);
+    if (existing) {
+      // 房间原成员：随时可回，无视密码和游戏状态
+      existing.online = true;
+      socket.data.roomId = roomId;
+      cb({ ok: true });
+      broadcastRoomList();
+      broadcastRoomState(roomId);
+      return;
+    }
+
     if (room.started) return cb({ ok: false, msg: '游戏已开始，无法加入' });
     if (room.password && room.password !== password) return cb({ ok: false, msg: '密码错误' });
-    if (room.players.find(p => p.id === socket.id)) return cb({ ok: false, msg: '你已在房间中' });
 
-    room.players.push({ id: socket.id, nickname: socket.data.nickname, account: socket.data.account, score: 0 });
-    socket.join(roomId);
+    room.players.push({ account: socket.data.account, nickname: socket.data.nickname, score: 0, online: true });
     socket.data.roomId = roomId;
     cb({ ok: true });
     broadcastRoomList();
@@ -315,19 +509,17 @@ io.on('connection', (socket) => {
 
   socket.on('leaveRoom', (cb) => {
     const roomId = socket.data.roomId;
-    if (!roomId) return cb && cb({ ok: false });
+    if (!roomId) return cb && cb({ ok: true });
     const room = rooms.get(roomId);
-    if (!room) { socket.data.roomId = null; return cb && cb({ ok: true }); }
-
-    room.players = room.players.filter(p => p.id !== socket.id);
-    socket.leave(roomId);
     socket.data.roomId = null;
+    if (!room) return cb && cb({ ok: true });
 
+    room.players = room.players.filter(p => p.account !== socket.data.account);
     if (room.players.length === 0) {
       clearRoomTimer(roomId);
       rooms.delete(roomId);
-    } else if (room.creatorId === socket.id) {
-      room.creatorId = room.players[0].id;
+    } else if (room.creatorAccount === socket.data.account) {
+      room.creatorAccount = room.players[0].account;
       room.creatorNickname = room.players[0].nickname;
     }
 
@@ -340,21 +532,29 @@ io.on('connection', (socket) => {
     const roomId = socket.data.roomId;
     const room = rooms.get(roomId);
     if (!room) return cb({ ok: false, msg: '房间不存在' });
-    if (room.creatorId !== socket.id) return cb({ ok: false, msg: '只有房主可以开始游戏' });
+    if (room.creatorAccount !== socket.data.account) return cb({ ok: false, msg: '只有房主可以开始游戏' });
     if (room.players.length < 3) return cb({ ok: false, msg: '至少需要3名玩家' });
 
+    // 随机打乱座次：猜词人顺序每局都不同
+    room.players = [...room.players].sort(() => Math.random() - 0.5);
+    for (const p of room.players) p.score = 0;
+
     room.started = true;
+    room.paused = false;
+    room.statsRecorded = false;
     room.gameState = {
       phase: 'waiting',
       roundNumber: 0,
       totalRounds: room.players.length * 2,
-      guesserId: null,
+      guesserAccount: null,
       guesserNickname: null,
       wordOptions: null,
       wordName: null,
       wordDescription: null,
-      honestPlayerId: null,
-      honestPlayerNickname: null,
+      categories: null,
+      correctCategory: null,
+      honestAccount: null,
+      honestNickname: null,
       timer: null,
       answerOrder: null,
       judgmentResult: null,
@@ -369,28 +569,46 @@ io.on('connection', (socket) => {
   socket.on('pauseGame', (cb) => {
     const roomId = socket.data.roomId;
     const room = rooms.get(roomId);
-    if (!room || room.creatorId !== socket.id) return cb({ ok: false });
-    room.started = false;
-    clearRoomTimer(roomId);
-    room.gameState = null;
+    if (!room || room.creatorAccount !== socket.data.account) return cb({ ok: false });
+    if (!room.started || !room.gameState) return cb({ ok: false });
+    room.paused = true;
+    clearRoomTimer(roomId); // 保留 _timerNext 和剩余秒数，继续时恢复
     cb({ ok: true });
-    broadcastRoomList();
     broadcastRoomState(roomId);
-    for (const p of room.players) {
-      const s = io.sockets.sockets.get(p.id);
-      if (s) s.emit('announcement', '房主已暂停游戏，房间已解锁');
+    announceRoom(roomId, '⏸ 房主暂停了游戏');
+  });
+
+  socket.on('resumeGame', (cb) => {
+    const roomId = socket.data.roomId;
+    const room = rooms.get(roomId);
+    if (!room || room.creatorAccount !== socket.data.account) return cb({ ok: false });
+    if (!room.paused) return cb({ ok: false });
+    room.paused = false;
+    if (room._timerNext && room.gameState && room.gameState.timer > 0) {
+      runRoomInterval(roomId);
     }
+    cb({ ok: true });
+    broadcastRoomState(roomId);
+    announceRoom(roomId, '▶ 游戏继续！');
+  });
+
+  socket.on('endGame', (cb) => {
+    const roomId = socket.data.roomId;
+    const room = rooms.get(roomId);
+    if (!room || room.creatorAccount !== socket.data.account) return cb({ ok: false });
+    if (!room.started || !room.gameState) return cb({ ok: false });
+    finishGame(roomId);
+    cb({ ok: true });
   });
 
   socket.on('dissolveRoom', (cb) => {
     const roomId = socket.data.roomId;
     const room = rooms.get(roomId);
-    if (!room || room.creatorId !== socket.id) return cb({ ok: false });
+    if (!room || room.creatorAccount !== socket.data.account) return cb({ ok: false });
     clearRoomTimer(roomId);
     for (const p of room.players) {
-      const s = io.sockets.sockets.get(p.id);
+      const s = getSocketByAccount(p.account);
       if (s) {
-        s.leave(roomId);
         s.data.roomId = null;
         s.emit('roomDissolved');
       }
@@ -403,7 +621,8 @@ io.on('connection', (socket) => {
   socket.on('refreshWords', (cb) => {
     const roomId = socket.data.roomId;
     const room = rooms.get(roomId);
-    if (!room || !room.gameState || room.gameState.guesserId !== socket.id) return cb({ ok: false });
+    if (!room || !room.gameState || room.gameState.guesserAccount !== socket.data.account) return cb({ ok: false });
+    if (room.paused) return cb({ ok: false, msg: '游戏已暂停' });
     room.gameState.wordOptions = pickRandomWords(roomId, 5);
     if (room.gameState.wordOptions.length === 0) {
       return cb({ ok: false, msg: '没有更多可用词条了' });
@@ -415,250 +634,116 @@ io.on('connection', (socket) => {
   socket.on('selectWord', ({ wordName }, cb) => {
     const roomId = socket.data.roomId;
     const room = rooms.get(roomId);
-    if (!room || !room.gameState || room.gameState.guesserId !== socket.id) return cb({ ok: false });
+    if (!room || !room.gameState || room.gameState.guesserAccount !== socket.data.account) return cb({ ok: false });
+    if (room.paused) return cb({ ok: false, msg: '游戏已暂停' });
+    if (room.gameState.phase !== 'choosing') return cb({ ok: false });
     const word = room.gameState.wordOptions.find(w => w.name === wordName);
     if (!word) return cb({ ok: false });
 
-    room.gameState.wordName = word.name;
-    room.gameState.wordDescription = word.description;
+    const gs = room.gameState;
+    gs.wordName = word.name;
+    gs.wordDescription = word.description;
+    gs.categories = word.categories ? [...word.categories].sort(() => Math.random() - 0.5) : null;
+    gs.correctCategory = word.correct || null;
 
-    const otherPlayers = room.players.filter(p => p.id !== room.gameState.guesserId);
-    const honestIndex = Math.floor(Math.random() * otherPlayers.length);
-    const honest = otherPlayers[honestIndex];
-    room.gameState.honestPlayerId = honest.id;
-    room.gameState.honestPlayerNickname = honest.nickname;
+    // 在线的非猜词人中随机指定老实人
+    const candidates = room.players.filter(p => p.account !== gs.guesserAccount && p.online);
+    const pool = candidates.length > 0 ? candidates : room.players.filter(p => p.account !== gs.guesserAccount);
+    const honest = pool[Math.floor(Math.random() * pool.length)];
+    gs.honestAccount = honest.account;
+    gs.honestNickname = honest.nickname;
 
     for (const p of room.players) {
-      const played = socketPlayedWords.get(p.id) || new Set();
+      const played = playedWordsByAccount.get(p.account) || new Set();
       played.add(word.name);
-      socketPlayedWords.set(p.id, played);
-      const sock = io.sockets.sockets.get(p.id);
-      if (sock && sock.data.account) {
+      playedWordsByAccount.set(p.account, played);
+      if (dbConnected) {
         PlayedWords.findOneAndUpdate(
-          { account: sock.data.account },
+          { account: p.account },
           { $addToSet: { words: word.name } },
           { upsert: true }
         ).catch(() => {});
       }
     }
 
-    room.gameState.phase = 'countdown_reveal';
+    gs.phase = 'countdown_reveal';
     cb({ ok: true });
-    broadcastRoomState(roomId);
-
-    for (const p of room.players) {
-      const s = io.sockets.sockets.get(p.id);
-      if (s) s.emit('announcement', `猜词人已选定词条！即将揭晓...`);
-    }
-
-    setTimeout(() => {
-      if (!rooms.has(roomId) || !room.gameState) return;
-      room.gameState.phase = 'viewing';
-      broadcastRoomState(roomId);
-
-      startTimer(roomId, 60, null, () => {
-        if (!rooms.has(roomId) || !room.gameState) return;
-        room.gameState.phase = 'preparing';
-        broadcastRoomState(roomId);
-
-        for (const p of room.players) {
-          const s = io.sockets.sockets.get(p.id);
-          if (s) s.emit('announcement', '准备环节开始！所有人只能看到词条名称');
-        }
-
-        startTimer(roomId, 20, null, () => {
-          if (!rooms.has(roomId) || !room.gameState) return;
-          room.gameState.phase = 'answering';
-
-          const others = room.players.filter(p => p.id !== room.gameState.guesserId);
-          const shuffled = others.sort(() => Math.random() - 0.5);
-          room.gameState.answerOrder = shuffled.map(p => ({ id: p.id, nickname: p.nickname }));
-
-          broadcastRoomState(roomId);
-          for (const p of room.players) {
-            const s = io.sockets.sockets.get(p.id);
-            if (s) s.emit('announcement', '开始答题！请按顺序作答');
-          }
-        });
-      });
-    }, 3000);
+    announceRoom(roomId, '猜词人已选定词条！即将揭晓...');
+    startPhaseTimer(roomId, 3, 'toViewing');
   });
 
   socket.on('startJudging', (cb) => {
     const roomId = socket.data.roomId;
     const room = rooms.get(roomId);
-    if (!room || !room.gameState || room.gameState.guesserId !== socket.id) return cb({ ok: false });
+    if (!room || !room.gameState || room.gameState.guesserAccount !== socket.data.account) return cb({ ok: false });
+    if (room.paused) return cb({ ok: false, msg: '游戏已暂停' });
+    if (room.gameState.phase !== 'answering') return cb({ ok: false });
     room.gameState.phase = 'judging';
     cb({ ok: true });
     broadcastRoomState(roomId);
   });
 
-  socket.on('submitJudgment', ({ honestId, bluffKingId }, cb) => {
+  socket.on('submitJudgment', ({ honestAccount, kingAccount }, cb) => {
     const roomId = socket.data.roomId;
     const room = rooms.get(roomId);
-    if (!room || !room.gameState || room.gameState.guesserId !== socket.id) return cb({ ok: false });
+    if (!room || !room.gameState || room.gameState.guesserAccount !== socket.data.account) return cb({ ok: false });
+    if (room.paused) return cb({ ok: false, msg: '游戏已暂停' });
+    if (room.gameState.phase !== 'judging') return cb({ ok: false });
 
-    const honestPlayer = room.players.find(p => p.id === honestId);
-    const bluffKingPlayer = room.players.find(p => p.id === bluffKingId);
+    const honestPlayer = room.players.find(p => p.account === honestAccount);
+    const kingPlayer = room.players.find(p => p.account === kingAccount);
+    if (!honestPlayer || !kingPlayer) return cb({ ok: false });
 
     room.gameState.judgmentResult = {
-      chosenHonestId: honestId,
-      chosenHonestNickname: honestPlayer ? honestPlayer.nickname : '?',
-      chosenBluffKingId: bluffKingId,
-      chosenBluffKingNickname: bluffKingPlayer ? bluffKingPlayer.nickname : '?'
+      honestAccount,
+      honestNickname: honestPlayer.nickname,
+      kingAccount,
+      kingNickname: kingPlayer.nickname
     };
 
     room.gameState.phase = 'reveal';
-    broadcastRoomState(roomId);
-
-    for (const p of room.players) {
-      const s = io.sockets.sockets.get(p.id);
-      if (s) {
-        s.emit('announcement',
-          `猜词人认为：${honestPlayer?.nickname} 是老实人，${bluffKingPlayer?.nickname} 是瞎掰王`);
-      }
-    }
-
-    setTimeout(() => {
-      if (!rooms.has(roomId) || !room.gameState) return;
-
-      const correct = honestId === room.gameState.honestPlayerId;
-      room.gameState.revealResult = {
-        realHonestId: room.gameState.honestPlayerId,
-        realHonestNickname: room.gameState.honestPlayerNickname,
-        correct
-      };
-
-      if (correct) {
-        const guesser = room.players.find(p => p.id === room.gameState.guesserId);
-        const honest = room.players.find(p => p.id === room.gameState.honestPlayerId);
-        if (guesser) guesser.score += 1;
-        if (honest) honest.score += 1;
-      } else {
-        const fakeHonest = room.players.find(p => p.id === honestId);
-        if (fakeHonest) fakeHonest.score += 2;
-      }
-
-      broadcastRoomState(roomId);
-
-      for (const p of room.players) {
-        const s = io.sockets.sockets.get(p.id);
-        if (s) {
-          if (correct) {
-            s.emit('announcement', `猜对了！真正的老实人就是 ${room.gameState.honestPlayerNickname}！猜词人和老实人各+1分`);
-          } else {
-            s.emit('announcement', `猜错了！真正的老实人是 ${room.gameState.honestPlayerNickname}！${honestPlayer?.nickname} 成功骗过猜词人，+2分`);
-          }
-        }
-      }
-
-      setTimeout(() => {
-        if (!rooms.has(roomId) || !room.gameState) return;
-        if (room.gameState.roundNumber >= room.gameState.totalRounds) {
-          room.gameState.phase = 'gameOver';
-          broadcastRoomState(roomId);
-          for (const p of room.players) {
-            const s = io.sockets.sockets.get(p.id);
-            if (s) s.emit('announcement', '游戏结束！查看最终排名');
-          }
-        } else {
-          startNextRound(roomId);
-        }
-      }, 5000);
-    }, 3000);
-  });
-
-  socket.on('nextRound', (cb) => {
-    const roomId = socket.data.roomId;
-    const room = rooms.get(roomId);
-    if (!room || room.creatorId !== socket.id) return cb({ ok: false });
-    startNextRound(roomId);
     cb({ ok: true });
-  });
-
-  socket.on('rejoinRoom', ({ roomId }, cb) => {
-    if (!socket.data.account) return cb({ ok: false, msg: '请先登录' });
-    const room = rooms.get(roomId);
-    if (!room) return cb({ ok: false, msg: '房间不存在' });
-
-    const existing = room.players.find(p => p.account === socket.data.account);
-    if (existing) {
-      if (existing._disconnectTimer) {
-        clearTimeout(existing._disconnectTimer);
-        existing._disconnectTimer = null;
-      }
-      existing.id = socket.id;
-      socket.join(roomId);
-      socket.data.roomId = roomId;
-      if (room.creatorId === existing._oldId) {
-        room.creatorId = socket.id;
-      }
-      if (room.gameState) {
-        const gs = room.gameState;
-        if (gs.guesserId === existing._oldId) gs.guesserId = socket.id;
-        if (gs.honestPlayerId === existing._oldId) gs.honestPlayerId = socket.id;
-        if (gs.answerOrder) {
-          gs.answerOrder.forEach(p => { if (p.id === existing._oldId) p.id = socket.id; });
-        }
-        if (gs.judgmentResult) {
-          const jr = gs.judgmentResult;
-          if (jr.chosenHonestId === existing._oldId) jr.chosenHonestId = socket.id;
-          if (jr.chosenBluffKingId === existing._oldId) jr.chosenBluffKingId = socket.id;
-        }
-        if (gs.revealResult && gs.revealResult.realHonestId === existing._oldId) {
-          gs.revealResult.realHonestId = socket.id;
-        }
-      }
-      delete existing._oldId;
-      cb({ ok: true });
-      broadcastRoomList();
-      broadcastRoomState(roomId);
-    } else {
-      if (room.started) return cb({ ok: false, msg: '游戏已开始，无法加入' });
-      room.players.push({ id: socket.id, nickname: socket.data.nickname, account: socket.data.account, score: 0 });
-      socket.join(roomId);
-      socket.data.roomId = roomId;
-      cb({ ok: true });
-      broadcastRoomList();
-      broadcastRoomState(roomId);
-    }
+    announceRoom(roomId, `猜词人认为：${honestPlayer.nickname} 是老实人，${kingPlayer.nickname} 是瞎掰王`);
+    startPhaseTimer(roomId, 3, 'toRevealResult');
   });
 
   socket.on('disconnect', () => {
+    const account = socket.data.account;
+    if (account && accountSockets.get(account) === socket.id) {
+      accountSockets.delete(account);
+    }
     const roomId = socket.data.roomId;
-    if (roomId) {
-      const room = rooms.get(roomId);
-      if (room) {
-        const player = room.players.find(p => p.id === socket.id);
-        if (player && socket.data.account) {
-          player._oldId = socket.id;
-          player.account = socket.data.account;
-          player._disconnectTimer = setTimeout(() => {
-            room.players = room.players.filter(p => p !== player);
-            if (room.players.length === 0) {
-              clearRoomTimer(roomId);
-              rooms.delete(roomId);
-            } else if (room.creatorId === player._oldId || room.creatorId === socket.id) {
-              room.creatorId = room.players[0].id;
-              room.creatorNickname = room.players[0].nickname;
-            }
-            broadcastRoomList();
-            if (rooms.has(roomId)) broadcastRoomState(roomId);
-          }, 60000);
-        } else {
-          room.players = room.players.filter(p => p.id !== socket.id);
-          if (room.players.length === 0) {
+    if (!roomId || !account) return;
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const player = room.players.find(p => p.account === account);
+    if (!player) return;
+
+    player.online = false;
+
+    // 游戏中的房间永不自动踢人；等待中的房间离线 60 秒后移出
+    if (!room.started) {
+      setTimeout(() => {
+        const r = rooms.get(roomId);
+        if (!r || r.started) return;
+        const pl = r.players.find(p => p.account === account);
+        if (pl && !pl.online) {
+          r.players = r.players.filter(p => p.account !== account);
+          if (r.players.length === 0) {
             clearRoomTimer(roomId);
             rooms.delete(roomId);
-          } else if (room.creatorId === socket.id) {
-            room.creatorId = room.players[0].id;
-            room.creatorNickname = room.players[0].nickname;
+          } else if (r.creatorAccount === account) {
+            r.creatorAccount = r.players[0].account;
+            r.creatorNickname = r.players[0].nickname;
           }
+          broadcastRoomList();
+          if (rooms.has(roomId)) broadcastRoomState(roomId);
         }
-        broadcastRoomList();
-        if (rooms.has(roomId)) broadcastRoomState(roomId);
-      }
+      }, 60000);
     }
+
+    broadcastRoomList();
+    broadcastRoomState(roomId);
   });
 });
 

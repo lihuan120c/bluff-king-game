@@ -160,6 +160,61 @@ input:focus { border-color: var(--primary); }
 }
 .btn-logout:active { background: rgba(225,112,85,.3); }
 
+.btn-profile {
+  width: 100%;
+  padding: 10px;
+  border: none;
+  border-radius: 8px;
+  background: rgba(108,92,231,.15);
+  color: var(--primary);
+  font-size: 14px;
+  cursor: pointer;
+  margin-bottom: 8px;
+  transition: background .2s;
+}
+.btn-profile:active { background: rgba(108,92,231,.3); }
+
+/* 个人主页 */
+.profile-head { margin-bottom: 16px; }
+.profile-nickname { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+.profile-account { font-size: 12px; color: var(--text-dim); }
+.profile-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.stat-box {
+  background: rgba(255,255,255,.05);
+  border-radius: 10px;
+  padding: 14px 8px;
+}
+.stat-num { font-size: 24px; font-weight: 700; color: var(--warning); }
+.stat-label { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+.profile-note { font-size: 11px; color: var(--text-dim); margin-bottom: 12px; }
+
+/* 离线玩家 / 暂停横幅 / 方向提示 */
+.player-chip.offline { opacity: 0.45; }
+.paused-banner {
+  background: rgba(253,203,110,.15);
+  color: var(--warning);
+  border: 1px solid rgba(253,203,110,.4);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 14px;
+  margin-bottom: 12px;
+}
+.category-hint {
+  display: inline-block;
+  background: rgba(108,92,231,.12);
+  color: var(--text);
+  border: 1px dashed rgba(108,92,231,.5);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 14px;
+  margin: 8px 0;
+}
+
 .btn-create {
   width: 100%;
   margin-bottom: 16px;
